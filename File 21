@@ -1,0 +1,309 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+
+# --- 1. Synthetic Data Generation ---
+# We'll simulate several factors influencing carbon footprint over time:
+# - Energy Consumption (e.g., TWh)
+# - Industrial Output (e.g., Production Index)
+# - Population (e.g., Millions)
+# - Policy Effectiveness (e.g., a score from 0 to 1, higher means better policy)
+# - Carbon Footprint (our target variable, e.g., Gigatons CO2e)
+
+def generate_carbon_footprint_data(num_years=50, start_year=1980, policy_change_year=2010, policy_effectiveness_factor=0.02, noise_level=0.05):
+    """
+    Generates synthetic time-series data for carbon footprint projection.
+    Simulates trends in influencing factors and a policy impact.
+    """
+    years = pd.date_range(start=f'{start_year}-01-01', periods=num_years, freq='Y')
+    
+    # Initialize base trends
+    energy_consumption = np.linspace(100, 300, num_years) + np.random.normal(0, 5, num_years)
+    industrial_output = np.linspace(80, 200, num_years) + np.random.normal(0, 3, num_years)
+    population = np.linspace(500, 800, num_years) + np.random.normal(0, 10, num_years)
+    policy_effectiveness = np.zeros(num_years)
+
+    # Simulate policy impact: gradual improvement after policy_change_year
+    policy_start_idx = num_years - (start_year + num_years - policy_change_year)
+    if policy_start_idx < num_years:
+        for i in range(policy_start_idx, num_years):
+            policy_effectiveness[i] = min(1.0, (i - policy_start_idx) * policy_effectiveness_factor)
+            # Apply policy impact to reduce energy consumption and industrial output growth
+            energy_consumption[i] -= energy_consumption[i] * policy_effectiveness[i] * 0.1
+            industrial_output[i] -= industrial_output[i] * policy_effectiveness[i] * 0.05
+
+    # Calculate carbon footprint based on factors
+    # Simple linear relationship for demonstration, with policy reducing it
+    carbon_footprint = (
+        energy_consumption * 0.5 +
+        industrial_output * 0.3 +
+        population * 0.01 -
+        (policy_effectiveness * 50) # Policy reduces carbon footprint
+    )
+    
+    # Add noise
+    carbon_footprint += np.random.normal(0, noise_level * 10, num_years)
+    energy_consumption += np.random.normal(0, noise_level * 2, num_years)
+    industrial_output += np.random.normal(0, noise_level * 1, num_years)
+    population += np.random.normal(0, noise_level * 5, num_years)
+
+    # Ensure non-negative values
+    carbon_footprint = np.maximum(0, carbon_footprint)
+    energy_consumption = np.maximum(0, energy_consumption)
+    industrial_output = np.maximum(0, industrial_output)
+    population = np.maximum(0, population)
+
+    df = pd.DataFrame({
+        'year': years,
+        'energy_consumption': energy_consumption,
+        'industrial_output': industrial_output,
+        'population': population,
+        'policy_effectiveness': policy_effectiveness,
+        'carbon_footprint': carbon_footprint # Our target variable
+    })
+    df = df.set_index('year')
+    return df
+
+# Generate data for 50 years
+np.random.seed(42) # for reproducibility
+synthetic_data = generate_carbon_footprint_data(num_years=50)
+
+print("Synthetic Data Head:")
+print(synthetic_data.head())
+print("\nSynthetic Data Tail:")
+print(synthetic_data.tail())
+
+# Plot the synthetic data to visualize trends
+plt.figure(figsize=(15, 10))
+
+plt.subplot(5, 1, 1)
+plt.plot(synthetic_data.index, synthetic_data['energy_consumption'], label='Energy Consumption')
+plt.title('Synthetic Carbon Footprint Influencing Factors')
+plt.ylabel('Energy (TWh)')
+plt.grid(True)
+plt.legend()
+
+plt.subplot(5, 1, 2)
+plt.plot(synthetic_data.index, synthetic_data['industrial_output'], label='Industrial Output')
+plt.ylabel('Index')
+plt.grid(True)
+plt.legend()
+
+plt.subplot(5, 1, 3)
+plt.plot(synthetic_data.index, synthetic_data['population'], label='Population')
+plt.ylabel('Millions')
+plt.grid(True)
+plt.legend()
+
+plt.subplot(5, 1, 4)
+plt.plot(synthetic_data.index, synthetic_data['policy_effectiveness'], label='Policy Effectiveness', color='purple')
+plt.ylabel('Score (0-1)')
+plt.grid(True)
+plt.legend()
+
+plt.subplot(5, 1, 5)
+plt.plot(synthetic_data.index, synthetic_data['carbon_footprint'], label='Carbon Footprint (Target)', color='green', linewidth=2)
+plt.ylabel('Gt CO2e')
+plt.xlabel('Year')
+plt.grid(True)
+plt.legend()
+
+plt.tight_layout()
+plt.show()
+
+
+# --- 2. Data Preprocessing for Deep Learning ---
+
+# Define features (X) and target (y)
+features = ['energy_consumption', 'industrial_output', 'population', 'policy_effectiveness']
+X = synthetic_data[features].values
+y = synthetic_data['carbon_footprint'].values.reshape(-1, 1) # Reshape for scaler
+
+# Normalize features and target
+scaler_X = MinMaxScaler(feature_range=(0, 1))
+X_scaled = scaler_X.fit_transform(X)
+
+scaler_y = MinMaxScaler(feature_range=(0, 1))
+y_scaled = scaler_y.fit_transform(y)
+
+# Create sequences for LSTM
+# We want to predict the carbon footprint for the next `forecast_horizon` years
+# based on the last `look_back` years of data.
+look_back = 5 # Use last 5 years of data to predict
+forecast_horizon = 1 # Predict 1 year into the future
+
+def create_sequences(data, target, look_back, forecast_horizon):
+    X_seq, y_seq = [], []
+    for i in range(len(data) - look_back - forecast_horizon + 1):
+        # Input sequence (look_back years of features)
+        X_seq.append(data[i:(i + look_back), :])
+        
+        # Target (carbon footprint at forecast_horizon ahead)
+        y_seq.append(target[i + look_back + forecast_horizon - 1, :])
+    return np.array(X_seq), np.array(y_seq)
+
+X_sequences, y_labels = create_sequences(X_scaled, y_scaled, look_back, forecast_horizon)
+
+print(f"\nShape of X_sequences (samples, timesteps, features): {X_sequences.shape}")
+print(f"Shape of y_labels (samples, target_features): {y_labels.shape}")
+
+# Split data into training and testing sets
+train_size = int(len(X_sequences) * 0.8)
+X_train, X_test = X_sequences[:train_size], X_sequences[train_size:]
+y_train, y_test = y_labels[:train_size], y_labels[train_size:]
+
+print(f"Training samples: {len(X_train)}, Testing samples: {len(X_test)}")
+
+# --- 3. Model Architecture (LSTM) ---
+
+model = Sequential([
+    LSTM(units=100, return_sequences=True, input_shape=(look_back, X_train.shape[2])),
+    Dropout(0.2),
+    LSTM(units=100, return_sequences=False),
+    Dropout(0.2),
+    Dense(units=y_train.shape[1]) # Output layer matches the number of target features (1 for carbon footprint)
+])
+
+model.compile(optimizer='adam', loss='mean_squared_error') # MSE for regression
+
+model.summary()
+
+# --- 4. Model Training ---
+
+# Use EarlyStopping to prevent overfitting
+early_stopping = EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True)
+
+print("\nTraining the LSTM model...")
+history = model.fit(
+    X_train, y_train,
+    epochs=200, # Can be increased, early stopping will manage
+    batch_size=16,
+    validation_split=0.2, # Use 20% of training data for validation
+    callbacks=[early_stopping],
+    verbose=1
+)
+
+print("\nTraining complete.")
+
+# Plot training history
+plt.figure(figsize=(12, 5))
+plt.plot(history.history['loss'], label='Train Loss')
+plt.plot(history.history['val_loss'], label='Validation Loss')
+plt.title('Model Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss (MSE)')
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# --- 5. Prediction/Forecasting ---
+
+print("\nEvaluating the model on test data...")
+loss = model.evaluate(X_test, y_test, verbose=0)
+print(f"Test Loss (MSE): {loss:.4f}")
+
+# Make predictions on the test set
+y_pred_scaled = model.predict(X_test)
+y_pred = scaler_y.inverse_transform(y_pred_scaled) # Inverse transform to get original scale
+
+y_test_original = scaler_y.inverse_transform(y_test) # Inverse transform actual test values
+
+print("\nSample Projections vs Actual (Test Set - Original Scale):")
+for i in range(min(10, len(y_test))): # Print first 10 predictions
+    print(f"Projected: {y_pred[i][0]:.2f} Gt CO2e, Actual: {y_test_original[i][0]:.2f} Gt CO2e")
+
+# --- 6. Future Projection ---
+# To project into the future, we need to provide future values for the features.
+# For synthetic data, we'll extrapolate the trends. In a real scenario,
+# you'd use external forecasts for energy, industrial output, population, and policy.
+
+num_future_years = 10
+last_data_point = synthetic_data.iloc[-1]
+last_year = synthetic_data.index[-1].year
+
+future_years = pd.date_range(start=f'{last_year + 1}-01-01', periods=num_future_years, freq='Y')
+
+# Simple linear extrapolation for future features (for demonstration)
+# This is a very basic method; more sophisticated forecasting would be needed in reality.
+future_energy_consumption = np.linspace(last_data_point['energy_consumption'], last_data_point['energy_consumption'] * 1.1, num_future_years)
+future_industrial_output = np.linspace(last_data_point['industrial_output'], last_data_point['industrial_output'] * 1.05, num_future_years)
+future_population = np.linspace(last_data_point['population'], last_data_point['population'] * 1.02, num_future_years)
+# Assume policy effectiveness slowly increases or stabilizes
+future_policy_effectiveness = np.linspace(last_data_point['policy_effectiveness'], min(1.0, last_data_point['policy_effectiveness'] + 0.1), num_future_years)
+
+future_features_df = pd.DataFrame({
+    'year': future_years,
+    'energy_consumption': future_energy_consumption,
+    'industrial_output': future_industrial_output,
+    'population': future_population,
+    'policy_effectiveness': future_policy_effectiveness
+}).set_index('year')
+
+print("\nFuture Features for Projection:")
+print(future_features_df)
+
+# Prepare future features for prediction
+future_features_scaled = scaler_X.transform(future_features_df.values)
+
+# Initialize a list to store projected carbon footprints
+projected_carbon_footprints = []
+current_sequence = X_scaled[-look_back:] # Start with the last 'look_back' known data points
+
+for i in range(num_future_years):
+    # Reshape the current sequence for the model (1 sample, look_back timesteps, features)
+    input_sequence = current_sequence.reshape(1, look_back, X_scaled.shape[1])
+    
+    # Predict the next carbon footprint (scaled)
+    next_carbon_footprint_scaled = model.predict(input_sequence, verbose=0)
+    
+    # Inverse transform the prediction to original scale
+    next_carbon_footprint = scaler_y.inverse_transform(next_carbon_footprint_scaled)[0][0]
+    projected_carbon_footprints.append(next_carbon_footprint)
+    
+    # Update the current_sequence for the next prediction
+    # Remove the oldest data point and add the new future features
+    # For this simple example, we are using the actual future features as if they were known.
+    # In a real scenario, you'd feed the *predicted* carbon footprint back into the sequence
+    # if it were also a feature, or rely solely on future feature forecasts.
+    
+    # For this setup, we just shift the window of future features
+    # and use the actual future features for the next prediction's input.
+    # This is a common way to do multi-step forecasting with known future exogenous variables.
+    
+    # Take the next set of future features to form the next sequence
+    if i < num_future_years - 1:
+        # Append the next future feature values to the sequence
+        # Note: This implies we are using the *actual* future features for prediction,
+        # which is often the case when exogenous variables are forecasted separately.
+        # If the model was truly autoregressive (predicting its own input),
+        # we'd append the predicted carbon footprint and then use it as a feature.
+        
+        # Here, we are effectively feeding the future_features_scaled sequentially
+        # as the input to predict the carbon footprint for that period.
+        current_sequence = np.vstack((current_sequence[1:], future_features_scaled[i].reshape(1, -1)))
+
+# Create a DataFrame for the projections
+projected_df = pd.DataFrame({
+    'year': future_years,
+    'projected_carbon_footprint': projected_carbon_footprints
+}).set_index('year')
+
+print("\nProjected Carbon Footprint for Future Years:")
+print(projected_df)
+
+# Plot historical data and future projections
+plt.figure(figsize=(12, 7))
+plt.plot(synthetic_data.index, synthetic_data['carbon_footprint'], label='Historical Carbon Footprint', color='blue')
+plt.plot(projected_df.index, projected_df['projected_carbon_footprint'], label='Projected Carbon Footprint', color='red', linestyle='--')
+plt.title('Carbon Footprint: Historical Data and Future Projections')
+plt.xlabel('Year')
+plt.ylabel('Carbon Footprint (Gt CO2e)')
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.show()
